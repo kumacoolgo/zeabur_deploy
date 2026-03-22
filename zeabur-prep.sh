@@ -3,26 +3,16 @@
 # ====================================================
 # Zeabur Node Production Init Script
 # Only for Ubuntu 24.04
-# 功能：
-# - 系统更新
-# - 基础工具安装
-# - BBR + sysctl 优化
-# - Swap
-# - Docker
-# - UFW
-# - Fail2ban
-# - journald 日志限额
 # ====================================================
 
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 trap 'echo "❌ 错误：脚本在第 ${LINENO} 行执行失败"; exit 1' ERR
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SWAP_SIZE="${SWAP_SIZE:-4G}"
-SWAPPINESS="${SWAPPINESS:-10}"
-VFS_CACHE_PRESSURE="${VFS_CACHE_PRESSURE:-50}"
 
 log() {
   echo
@@ -31,81 +21,172 @@ log() {
   echo "===================================================="
 }
 
-warn() {
-  echo "⚠️  $1"
-}
-
 die() {
   echo "❌ $1"
   exit 1
 }
 
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    die "请使用 root 权限运行此脚本"
+# 1. root 检查
+if [[ "${EUID}" -ne 0 ]]; then
+  die "请使用 root 权限运行"
+fi
+
+# 2. 系统检查（强制 24.04）
+source /etc/os-release
+
+if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "24.04" ]]; then
+  die "当前系统 ${ID} ${VERSION_ID}，必须使用 Ubuntu 24.04"
+fi
+
+echo "✅ 系统检测通过：Ubuntu 24.04"
+
+# 3. 更新系统
+log "更新系统与基础包"
+
+apt-get update
+apt-get upgrade -y \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold"
+
+apt-get install -y \
+  curl wget git vim ufw fail2ban \
+  ca-certificates gnupg lsb-release \
+  openssh-server
+
+# 4. BBR + sysctl
+log "配置 BBR"
+
+cat >/etc/sysctl.d/99-zeabur.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+EOF
+
+sysctl --system >/dev/null
+
+# 5. Swap
+log "配置 Swap (${SWAP_SIZE})"
+
+if ! swapon --show | grep -q '^/swapfile'; then
+  if [[ ! -f /swapfile ]]; then
+    fallocate -l "${SWAP_SIZE}" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
   fi
+
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+else
+  echo "Swap 已启用，跳过"
+fi
+
+# 6. Docker
+log "安装 Docker"
+
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | bash
+fi
+
+systemctl enable docker --now
+systemctl is-active --quiet docker || die "Docker 启动失败"
+
+mkdir -p /etc/docker
+
+cat >/etc/docker/daemon.json <<EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  },
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "storage-driver": "overlay2"
 }
+EOF
 
-check_os() {
-  [[ -f /etc/os-release ]] || die "无法识别系统：/etc/os-release 不存在"
-  source /etc/os-release
+systemctl restart docker
 
-  if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "24.04" ]]; then
-    die "当前系统为 ${ID:-unknown} ${VERSION_ID:-unknown}，Zeabur 节点脚本仅支持 Ubuntu 24.04"
-  fi
+# 7. Fail2ban（永久封禁）
+log "配置 Fail2ban（3次失败永久封禁）"
 
-  echo "✅ 系统检测通过：Ubuntu 24.04"
-}
+cat >/etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+backend = systemd
+bantime = -1
+findtime = 3600
+maxretry = 3
 
-check_resources() {
-  log "检查基础资源"
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+EOF
 
-  local mem_mb cpu_count
-  mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
-  cpu_count="$(nproc)"
+systemctl enable fail2ban --now
+systemctl restart fail2ban
 
-  echo "内存: ${mem_mb} MB"
-  echo "CPU : ${cpu_count} 核"
+# 8. UFW（已修复 sshd 问题）
+log "配置 UFW"
 
-  if (( mem_mb < 1800 )); then
-    warn "当前内存低于 2GB，可能不满足 Zeabur 最低要求"
-  fi
+# 用绝对路径，避免 PATH 问题
+if [ -x /usr/sbin/sshd ]; then
+  ssh_port="$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)"
+else
+  ssh_port=""
+fi
 
-  if (( cpu_count < 1 )); then
-    warn "当前 CPU 核数异常"
-  fi
-}
+ssh_port="${ssh_port:-22}"
+echo "检测到 SSH 端口: ${ssh_port}"
 
-apt_install_base() {
-  log "更新系统并安装基础软件"
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
 
-  apt-get update
-  apt-get upgrade -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+ufw allow "${ssh_port}/tcp"
 
-  apt-get install -y \
-    curl \
-    wget \
-    git \
-    vim \
-    ufw \
-    fail2ban \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    openssh-server \
-    apt-transport-https \
-    software-properties-common
+# Zeabur 必要端口
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 4222/tcp
+ufw allow 6443/tcp
+ufw allow 30000:32767/tcp
+ufw allow 30000:32767/udp
 
-  apt-get autoremove -y
-  apt-get autoclean -y
-}
+ufw --force enable
 
-configure_sysctl() {
-  log "配置内核参数 / BBR"
+# 9. journald 限制
+log "限制日志大小"
 
-  cat >/etc/sysctl.d/99-zeabur.conf <<EOF
+mkdir -p /etc/systemd/journald.conf.d
+
+cat >/etc/systemd/journald.conf.d/99-zeabur.conf <<EOF
+[Journal]
+SystemMaxUse=200M
+SystemKeepFree=100M
+MaxRetentionSec=7day
+EOF
+
+systemctl restart systemd-journald
+
+# 10. 输出状态
+log "完成"
+
+echo "BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"
+echo "Swap:"
+free -h | grep Swap || true
+
+echo "Docker:"
+docker --version
+
+echo "Fail2ban:"
+fail2ban-client status sshd || true
+
+echo "UFW:"
+ufw status verbose || true
+
+echo
+echo "✅ Zeabur 节点初始化完成"  cat >/etc/sysctl.d/99-zeabur.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 vm.swappiness=${SWAPPINESS}
