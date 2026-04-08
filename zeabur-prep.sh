@@ -171,16 +171,12 @@ EOF
 
 configure_ufw() {
   log "配置 UFW"
-
-  local ssh_port
-  ssh_port="$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || echo 22)"
-
-  echo "SSH 端口: ${ssh_port}"
+  echo "SSH 端口: 22"
 
   ufw default deny incoming
   ufw default allow outgoing
 
-  ufw allow "${ssh_port}/tcp"
+  ufw allow 22/tcp
 
   # Zeabur 必需端口
   ufw allow 80/tcp
