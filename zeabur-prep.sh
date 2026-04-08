@@ -85,7 +85,8 @@ apt_install_base() {
     gnupg \
     lsb-release \
     openssh-server \
-    unattended-upgrades
+    unattended-upgrades \
+    unzip
 
   apt-get autoremove -y
   apt-get autoclean -y
