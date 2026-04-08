@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
 
 # ====================================================
-# Zeabur Node Production Init Script
+# Zeabur Node Production Init Script (Custom)
 # Only for Ubuntu 24.04
-# 功能：
-# - 系统更新
-# - 基础工具安装
-# - BBR + sysctl 优化
-# - Swap
-# - Docker
-# - UFW
-# - Fail2ban
-# - journald 日志限额
+# 优化版（按你的需求裁剪）
 # ====================================================
 
 set -Eeuo pipefail
@@ -20,7 +12,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 trap 'echo "❌ 错误：脚本在第 ${LINENO} 行执行失败"; exit 1' ERR
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="2.0.0"
+
 SWAP_SIZE="${SWAP_SIZE:-4G}"
 SWAPPINESS="${SWAPPINESS:-10}"
 VFS_CACHE_PRESSURE="${VFS_CACHE_PRESSURE:-50}"
@@ -49,11 +42,10 @@ require_root() {
 
 check_os() {
   [[ -f /etc/os-release ]] || die "无法识别系统：/etc/os-release 不存在"
-  # shellcheck disable=SC1091
   source /etc/os-release
 
   if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "24.04" ]]; then
-    die "当前系统为 ${ID:-unknown} ${VERSION_ID:-unknown}，Zeabur 节点脚本仅支持 Ubuntu 24.04"
+    die "当前系统为 ${ID:-unknown} ${VERSION_ID:-unknown}，仅支持 Ubuntu 24.04"
   fi
 
   echo "✅ 系统检测通过：Ubuntu 24.04"
@@ -92,21 +84,34 @@ apt_install_base() {
     ca-certificates \
     gnupg \
     lsb-release \
-    openssh-server
+    openssh-server \
+    unattended-upgrades
 
   apt-get autoremove -y
   apt-get autoclean -y
+
+  # 自动安全更新
+  cat >/etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
 }
 
 configure_sysctl() {
-  log "配置 BBR 与内核参数"
+  log "配置内核参数（BBR + TCP优化）"
 
   cat >/etc/sysctl.d/99-zeabur.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.core.somaxconn=4096
+
 vm.swappiness=${SWAPPINESS}
 vm.vfs_cache_pressure=${VFS_CACHE_PRESSURE}
-fs.file-max=1048576
+
 net.ipv4.ip_forward=1
 EOF
 
@@ -127,51 +132,18 @@ configure_swap() {
           2G) dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress ;;
           4G) dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress ;;
           8G) dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress ;;
-          *) die "dd 回退模式仅内置支持 1G/2G/4G/8G，请直接用这些值之一作为 SWAP_SIZE" ;;
+          *) die "dd 模式仅支持 1G/2G/4G/8G" ;;
         esac
       fi
 
       chmod 600 /swapfile
       mkswap /swapfile >/dev/null
-    else
-      echo "/swapfile 已存在，直接启用"
     fi
 
     swapon /swapfile
   fi
 
   grep -qE '^/swapfile\s' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-}
-
-install_docker() {
-  log "安装 Docker"
-
-  if ! command -v docker >/dev/null 2>&1; then
-    curl -fsSL https://get.docker.com | bash
-  else
-    echo "Docker 已安装，跳过"
-  fi
-
-  systemctl enable docker --now
-  systemctl is-active --quiet docker || die "Docker 启动失败"
-
-  mkdir -p /etc/docker
-
-  cat >/etc/docker/daemon.json <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "50m",
-    "max-file": "3"
-  },
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "storage-driver": "overlay2",
-  "live-restore": true
-}
-EOF
-
-  systemctl restart docker
-  systemctl is-active --quiet docker || die "Docker 重启失败"
 }
 
 configure_fail2ban() {
@@ -195,29 +167,22 @@ EOF
 
   systemctl enable fail2ban --now
   systemctl restart fail2ban
-  systemctl is-active --quiet fail2ban || die "Fail2ban 启动失败"
 }
 
 configure_ufw() {
   log "配置 UFW"
 
   local ssh_port
-  if [[ -x /usr/sbin/sshd ]]; then
-    ssh_port="$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)"
-  else
-    ssh_port=""
-  fi
+  ssh_port="$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || echo 22)"
 
-  ssh_port="${ssh_port:-22}"
-  echo "检测到 SSH 端口: ${ssh_port}"
+  echo "SSH 端口: ${ssh_port}"
 
-  ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
 
   ufw allow "${ssh_port}/tcp"
 
-  # Zeabur 要求端口
+  # Zeabur 必需端口
   ufw allow 80/tcp
   ufw allow 443/tcp
   ufw allow 4222/tcp
@@ -229,7 +194,7 @@ configure_ufw() {
 }
 
 configure_journald() {
-  log "限制 journald 日志体积"
+  log "限制 journald 日志"
 
   mkdir -p /etc/systemd/journald.conf.d
 
@@ -244,55 +209,45 @@ EOF
 }
 
 final_status() {
-  log "初始化完成，输出状态"
+  log "初始化完成"
 
   echo "脚本版本: ${SCRIPT_VERSION}"
   echo "系统版本: $(. /etc/os-release && echo "${PRETTY_NAME}")"
   echo "内核版本: $(uname -r)"
-  echo "主机名  : $(hostname)"
   echo
 
-  echo "BBR 状态:"
+  echo "BBR:"
   sysctl net.ipv4.tcp_congestion_control
-  sysctl net.core.default_qdisc
   echo
 
-  echo "Swap 状态:"
+  echo "Swap:"
   free -h | grep -i swap || true
-  swapon --show || true
   echo
 
-  echo "Docker 状态:"
-  docker --version
-  systemctl --no-pager --full status docker | sed -n '1,8p' || true
-  echo
-
-  echo "Fail2ban 状态:"
+  echo "Fail2ban:"
   fail2ban-client status || true
   echo
-  fail2ban-client status sshd || true
-  echo
 
-  echo "UFW 状态:"
+  echo "UFW:"
   ufw status verbose || true
   echo
 
-  echo "监听端口概览:"
-  ss -tulpn | grep -E ':(22|80|443|4222|6443|30000|32767)\b|Local Address' || true
+  echo "端口监听:"
+  ss -tulpn | grep -E ':(22|80|443|4222|6443|30000)' || true
   echo
 
-  echo "✅ Zeabur 节点基础初始化完成"
+  echo "✅ 初始化完成"
 }
 
 main() {
-  echo "Zeabur Node Production Init Script v${SCRIPT_VERSION}"
+  echo "Zeabur Init Script v${SCRIPT_VERSION}"
+
   require_root
   check_os
   check_resources
   apt_install_base
   configure_sysctl
   configure_swap
-  install_docker
   configure_fail2ban
   configure_ufw
   configure_journald
