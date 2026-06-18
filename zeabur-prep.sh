@@ -44,7 +44,7 @@ check_os() {
   [[ -f /etc/os-release ]] || die "无法识别系统：/etc/os-release 不存在"
   source /etc/os-release
 
-  if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "24.04" ]]; then
+  if [[ "${ID}" != "ubuntu" || ! "${VERSION_ID}" =~ ^24\.04(\..*)?$ ]]; then
     die "当前系统为 ${ID:-unknown} ${VERSION_ID:-unknown}，仅支持 Ubuntu 24.04"
   fi
 
