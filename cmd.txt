@@ -1,5 +1,7 @@
 curl -fsSL -o zeabur-init.sh https://raw.githubusercontent.com/kumacoolgo/zeabur_deploy/main/zeabur-prep.sh
 
 chmod +x zeabur-init.sh
-  
-sudo bash zeabur-init.sh
+
+bash -n zeabur-init.sh
+
+sudo env SSH_PORT=7722 bash zeabur-init.sh
