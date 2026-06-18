@@ -12,8 +12,9 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 trap 'echo "❌ 错误：脚本在第 ${LINENO} 行执行失败"; exit 1' ERR
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
+SSH_PORT="${SSH_PORT:-22}"
 SWAP_SIZE="${SWAP_SIZE:-4G}"
 SWAPPINESS="${SWAPPINESS:-10}"
 VFS_CACHE_PRESSURE="${VFS_CACHE_PRESSURE:-50}"
@@ -86,7 +87,12 @@ apt_install_base() {
     lsb-release \
     openssh-server \
     unattended-upgrades \
-    unzip
+    unzip \
+    iproute2 \
+    net-tools \
+    htop \
+    jq \
+    dnsutils
 
   apt-get autoremove -y
   apt-get autoclean -y
@@ -122,19 +128,26 @@ EOF
 configure_swap() {
   log "配置 Swap (${SWAP_SIZE})"
 
-  if swapon --show | grep -q '^/swapfile'; then
+  if swapon --show | awk '{print $1}' | grep -qx '/swapfile'; then
     echo "Swap 已启用，跳过创建"
   else
-    if [[ ! -f /swapfile ]]; then
+    if [[ -f /swapfile ]]; then
+      warn "/swapfile 已存在，重新格式化为 swap"
+      swapoff /swapfile 2>/dev/null || true
+      chmod 600 /swapfile
+      mkswap -f /swapfile >/dev/null
+    else
       if ! fallocate -l "${SWAP_SIZE}" /swapfile; then
         warn "fallocate 失败，改用 dd 创建 swapfile"
-        case "${SWAP_SIZE}" in
-          1G) dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress ;;
-          2G) dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress ;;
-          4G) dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress ;;
-          8G) dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress ;;
-          *) die "dd 模式仅支持 1G/2G/4G/8G" ;;
-        esac
+
+        local swap_mb
+        swap_mb="$(numfmt --from=iec --to-unit=1048576 "${SWAP_SIZE}" 2>/dev/null || true)"
+
+        if [[ -z "${swap_mb}" || "${swap_mb}" -le 0 ]]; then
+          die "无法解析 SWAP_SIZE=${SWAP_SIZE}，请使用 1G/2G/4G/8G 这类格式"
+        fi
+
+        dd if=/dev/zero of=/swapfile bs=1M count="${swap_mb}" status=progress
       fi
 
       chmod 600 /swapfile
@@ -172,12 +185,15 @@ EOF
 
 configure_ufw() {
   log "配置 UFW"
-  echo "SSH 端口: 22"
+  echo "SSH 端口: ${SSH_PORT}"
 
   ufw default deny incoming
   ufw default allow outgoing
 
-  ufw allow 22/tcp
+  # ip_forward=1 配套设置：允许转发
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+
+  ufw allow "${SSH_PORT}/tcp"
 
   # Zeabur 必需端口
   ufw allow 80/tcp
@@ -213,8 +229,16 @@ final_status() {
   echo "内核版本: $(uname -r)"
   echo
 
+  echo "SSH 端口:"
+  echo "${SSH_PORT}"
+  echo
+
   echo "BBR:"
   sysctl net.ipv4.tcp_congestion_control
+  echo
+
+  echo "IP Forward:"
+  sysctl net.ipv4.ip_forward
   echo
 
   echo "Swap:"
@@ -230,7 +254,7 @@ final_status() {
   echo
 
   echo "端口监听:"
-  ss -tulpn | grep -E ':(22|80|443|4222|6443|30000)' || true
+  ss -tulpn | grep -E ":(${SSH_PORT}|80|443|4222|6443|30000)" || true
   echo
 
   echo "✅ 初始化完成"
